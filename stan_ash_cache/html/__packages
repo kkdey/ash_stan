@@ -1,0 +1,14 @@
+base
+Rcpp
+inline
+rstan
+truncnorm
+plyr
+SQUAREM
+foreach
+iterators
+doParallel
+MASS
+lattice
+pscl
+ashr
