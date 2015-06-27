@@ -1,0 +1,432 @@
+---
+title: "Ash using STAN"
+author: "Kushal Kumar Dey"
+date: "Wednesday, May 27, 2015"
+output: html_document
+---
+
+## GLM Ash model under STAN
+
+Suppose we have read counts expression data in RNa-seq for a gene across the different tissue samples as in the GTEX experiment. Now many of these tissue samples are coming from the same tissue and are likely to give same expression. At the same time, there can be certain batch effects. One likely such effect can be the person label effect (tissue samples coming from the same person may be correlated). In general RNA-seq experiments, there could be even more technical effects resulting from amplification, sequencing among others.
+
+The idea then is to take the vector of counts corresponding to each gene $g$ and then for each entry use the model 
+
+$$ c_{ng} \sim Poi( exp(\mu_g + \beta_{t(n):g} + \nu_{b(n):g}))  $$
+
+where $\mu_g$ is the overall mean effect, $\beta_{t(n):g}$ is the tissue effect, $t(n)$ is the tissue identifier in our case, which ranges from $1$ to $53$ and finally $\nu_{b(n):g}$ is the person effect/ batch effect and $b(n)$ is the label of the person from whom the tissue sample has been taken.
+
+**Motivation of ASH  for this model** : To not only estimate the tissue specific effects and the batch effects but also to shrink the estimates approprtiately. Such a method becomes all the more relevant when we have some individuals having way more variation and some others, depending on the genotypic configuration of the cis-eQTL for the gene may be??
+
+**Model assumptions in ASH** : We assume in this case, the tissue-effects are exchangeable among themselves, and sp are the batch effects. The following prior model for tissue-effects is assumed 
+
+$$ \beta_{t:g} \sim \pi_0 + \sum_{k=1}^{K} \pi_k N(0,\sigma^2_k)  \qquad \qquad \forall t=1,2,\cdots,T$$
+
+$$ \nu_{b:g} \sim \pi_0 + \sum_{k=1}^{L} \omega_l N(0,\delta^2_l) \qquad \qquad \forall b=1,2,\cdots,B$$
+
+where $T$ and $B$ are the total number of tissues and total number of batches considered in the data.
+We assume Dirichlet priors on $\pi$ and $\omega$ given as follows 
+
+$$ \pi \sim Dir \left (1,\frac{1}{K},\frac{1}{K},\cdots,\frac{1}{K} \right ) $$
+
+$$ \omega \sim Dir \left (1,\frac{1}{L},\frac{1}{L},\cdots,\frac{1}{L} \right ) $$
+
+*Choice of mixing scales* : One of the most important considerations here would be what should we choose as the priors for the mixing scales $\sigma_k$ and $\delta_l$. One idea would be to do a generalized linear model, get the standard errors for each of these effects and then use them to form the grid as in the usual ash model. But my feeling is that would be time and computationially expensive (even compared to cases with Jeffrey's prior or other standard prors on $\sigma$ and $\delta$)
+
+I first assume a model with only one effect, namely the tissue specific effect. So, the revised model now is 
+
+$$ c_{ng} \sim Poi(exp(\mu_g + \beta_{t(n):g})) $$
+
+and 
+
+$$ \mu_g \sim N(0,1000) $$
+
+$$ \beta_{t:g} \sim \pi_0 + \sum_{k=1}^{K} \pi_k N(0,\sigma^2_k)  \qquad \qquad \forall t=1,2,\cdots,T$$
+
+$$ \pi \sim Dir \left (1,\frac{1}{K},\frac{1}{K},\cdots,\frac{1}{K} \right ) $$
+
+We now define
+
+$$ s_{min} =  \underset{t \in T}{min} \left [  \frac{1}{\{n: t(n)=t \}-1} \sum_{n:t(n)=t} (log c_{ng} -\bar{log c}_g)^2 \right ] $$
+
+$$ s_{max} =  \underset{t \in T}{min}  \left [  \frac{1}{\{n: t(n)=t \}-1} \sum_{n:t(n)=t} (log c_{ng} -\bar{log c}_g)^2  \right ] $$
+
+We then assume the model where 
+
+$$ \sigma_k = (\sqrt{2})^{k} s_{min} $$
+
+and we take k=1,2,\cdots, K$ such that $K$ is the lst positive integer such that $\sigma_K = (\sqrt{2})^{K} s_{min} < s_{max}$
+
+
+## STAN simulation set up
+
+We present a simulation scenario where we fix a particular gene, consider a vector of counts of length 50 across 5 tissues, one tissue contributing 10 observations. 
+
+```{r sim_setup}
+
+#setwd("Documents/Matthew Stephens Project/STAN_ash/")
+
+### An example betahat vector of effects
+
+beta_vec=rep(rnorm(10,0,1),each=10);
+
+### the intercept term 
+mu=10;
+
+### generating the Poisson counts y
+
+y=rpois(rep(1,length(beta_vec)),exp(mu+beta_vec))
+N=length(y)
+
+### the batch labels
+
+batch=rep(1:10,each=10);
+B=length(unique(batch));
+```
+
+
+Fixing the ash model to be fitted to the above Poisson GLM framework.
+
+```{r model_glm_ash, eval=FALSE}
+### fixing the standard errors of the mixture components
+
+
+se_batch=tapply(log(y+1),batch,sd);
+beta_batch=tapply(log(y+1) - mean(log(y+1)),batch,mean);
+
+autoselect.mixsd = function(betahat,sebetahat,mult){
+  sebetahat=sebetahat[sebetahat!=0] #To avoid exact measure causing (usually by mistake)
+  sigmaamin = min(sebetahat)/10 #so that the minimum is small compared with measurement precision
+  if(all(betahat^2<=sebetahat^2)){
+    sigmaamax = 8*sigmaamin #to deal with the occassional odd case where this could happen; 8 is arbitrary
+  }else{
+    sigmaamax = 2*sqrt(max(betahat^2-sebetahat^2)) #this computes a rough largest value you'd want to use, based on idea that sigmaamax^2 + sebetahat^2 should be at least betahat^2   
+  }
+  if(mult==0){
+    return(c(0,sigmaamax/2))
+  }else{
+    npoint = ceiling(log2(sigmaamax/sigmaamin)/log2(mult))
+    return(mult^((-npoint):0) * sigmaamax)
+  }
+}
+
+se_mix=c(0,autoselect.mixsd(beta_batch,se_batch,sqrt(2)));
+K=length(se_mix);
+
+###  Dirichlet prior for the mixture weights
+
+dir_param=c(1,rep(1/(length(se_mix)-1),length(se_mix)-1));
+
+
+### Framing the data in STAN input format
+
+test_data.ash <- list(N=length(y),
+                      K=length(se_mix),
+                      B=length(unique(batch)),
+                      counts=y,
+                      batch=batch,
+                      se_mix=se_mix,
+                      alpha=dir_param);
+
+### Fitting STAN
+
+setwd("/Users/kushal/Documents/Matthew Stephens Project/STAN_ash/")
+source("http://mc-stan.org/rstan/stan.R")
+fit1 <- suppressMessages(suppressWarnings(stan(file="ash_reg_poissonglm_propdir.stan", data=test_data.ash,iter=10000,chains=3,verbose=FALSE)));
+
+temp=summary(fit1)$summary[,"mean"]
+beta_temp.1=as.numeric(temp[grep("beta",names(temp))]);
+round(beta_temp.1,digits=3)
+
+### Fitting GLMER for comparison
+
+library(lme4)
+fit_glm=glmer(y~ 1+(1|batch),family=poisson)
+
+ash_res=ash(as.numeric(as.matrix(ranef(fit_glm)$batch)),rep(1,10))
+
+```
+
+The vectors of effect sizes obtained after applying the above ash mechanism and the GLMER mechanisms are as follows 
+
+```{r ex_output}
+
+## glm-ash estimates
+
+ beta_glm_ash= c(0.62,  0.02,  0.31, -1.96,  0.00,  0.15, -1.88, -0.80,  2.06,  0.03);
+ print(beta_glm_ash);
+
+##  glmer estimates
+
+ beta_glmer = c(0.77, 0.16, 0.45, -1.81,  0.14,  0.30, -1.73, -0.66,  2.21,  0.17);
+ print(beta_glmer);
+
+## true values of simulation
+
+print(round(unique(beta_vec),digits=2))
+
+
+```
+
+## Standard Ash model under STAN
+
+Suppose we have the estimates of some parameters $\hat{\beta} = \left( \hat{\beta}_1, \hat{\beta}_2, \cdots, \hat{\beta}_n \right)$ and standard error of $\hat{\beta}$ is $se(\hat{\beta}) = \left( s_1, s_2, \cdots, s_n \right)$. Using this we want to perform shrinkage on the parameters $\beta = c(\beta_1, \beta_2, \cdots, \beta_n)$. We use the model
+
+$$  L(\hat{\beta},\beta,s) \propto \prod_{n=1}^{N} exp \left (-0.5* \frac{(\hat{\beta}_n - \beta_n)^2}{s^2_n} \right )$$
+
+which is equivalent to the assumption 
+
+$$ \hat{\beta}_n \sim N \left ( \beta_n, s^2_n \right )  $$
+
+We assume that all the $\beta_n$ are all iid with the prior 
+
+$$ \beta_n \sim  \pi_0 + \sum_{k=1}^{K} \pi_k N(0, \sigma^2_k)  $$
+
+Here we take 
+
+$$ \pi \sim Dir \left (1,\frac{1}{K},\frac{1}{K},\cdots,\frac{1}{K} \right ) $$
+
+giving more weightage to 0 value (as we are shrinking to 0).
+
+We need to determine the number of mixtures K and the mixing scales $\sigma_k$ in the above model. For determining the mixing scales, we first extract $s_{min}$ and $s_{max}$, the minimum and the maximum values of the standard errors from the above standard error vector and then we define the number of mixtures $K$ as $K$ is the first positive integer such that $\sigma_K = (\sqrt{2})^{K} s_{min} > s_{max}$. Under this assumption, we perform a toy example of the use of Ash_STAN for shrinkage based estimation.
+
+```{r sim_setup_2}
+suppressMessages(library(rstan))
+suppressMessages(library(ashr))
+
+betahat=c(0,1.03,0.05,0.67,2.06,3.11,2.22,1.19,1.43,1.2,0.03,10.54,8.66);
+sebetahat=c(0.01,1,0.2,0.15,0.44,0.62,0.31,0.29,0.01,0.11,0.50,10.11,10.43);
+
+```
+
+Applying the ash function from the **ashr** package of Matthew's
+
+```{r ash_setup}
+#setwd("Documents/Matthew Stephens Project/STAN_ash/")
+fit=ash(betahat,sebetahat,mixcompdist="normal")
+fitted_post_mean=fit$PosteriorMean;
+```
+
+
+We now apply the Ash_STAN framework 
+
+```{r stan-ash_setup,eval=FALSE}
+
+
+autoselect.mixsd = function(betahat,sebetahat,mult){
+  sebetahat=sebetahat[sebetahat!=0] #To avoid exact measure causing (usually by mistake)
+  sigmaamin = min(sebetahat)/10 #so that the minimum is small compared with measurement precision
+  if(all(betahat^2<=sebetahat^2)){
+    sigmaamax = 8*sigmaamin #to deal with the occassional odd case where this could happen; 8 is arbitrary
+  }else{
+    sigmaamax = 2*sqrt(max(betahat^2-sebetahat^2)) #this computes a rough largest value you'd want to use, based on idea that sigmaamax^2 + sebetahat^2 should be at least betahat^2   
+  }
+  if(mult==0){
+    return(c(0,sigmaamax/2))
+  }else{
+    npoint = ceiling(log2(sigmaamax/sigmaamin)/log2(mult))
+    return(mult^((-npoint):0) * sigmaamax)
+  }
+}
+
+se_mix=c(0,autoselect.mixsd(betahat,sebetahat,sqrt(2)));
+K=length(se_mix);
+
+dir_param=c(1,rep(1/(K-1),K-1));
+
+
+test_data.ash <- list(N=length(betahat),
+                      K=length(se_mix),
+                      betahat=betahat,
+                      se=sebetahat,
+                      se_mix=se_mix,
+                      alpha=dir_param);
+
+### Fitting STAN
+
+fit1 <- suppressMessages(suppressWarnings(stan(file="ash_reg_stan_propdir.stan", data=test_data.ash,iter=10000,chains=10,verbose=FALSE)));
+
+temp=summary(fit1)$summary[,"mean"]
+beta_temp.1=as.numeric(temp[grep("beta",names(temp))]);
+round(beta_temp.1,digits=3)
+
+
+### Fitted posterior mean for ASH
+
+print(fitted_post_mean)
+
+
+```
+
+### Remarks
+
+We have observed on multiple runs of the Ash_STAN that when the standard errors of the $\hat{\beta}$ are high, they tend to produce fluctuations in the ash output. We observed this for the last two entries of the above vector which had standard errors of $\hat{\beta}$ around $10$ and as a result, gave pretty fluctuating outputs on repeated runs of the experiment. 
+
+One output from the model fit over 10 chains (10,000 iterations each) is given by 
+
+```{r ex_output_2}
+
+beta_ash=c(0.000, 0.234, 0.003, 0.663, 1.911, 2.709, 2.138, 1.147, 1.429, 1.194, 0.004, 0.099, 0.076);
+print(beta_ash);
+beta_stan_ash = c(-0.001,  0.323, -0.004,  0.626,  1.959,  3.068,  2.052,  1.379,  1.432,  1.184,  0.095,  0.431,  1.192);
+print(beta_stan_ash);
+
+```
+
+
+## The Model codes
+
+The model code for the STAN_ash GLM model fit is given by 
+
+```{r model_stan_ash_glm, echo=TRUE, eval=FALSE}
+
+/* Stan Model Tutorial : Adaptive Shrinkage for Poisson GLM Model (grid prior for beta)
+ * Author: Kushal Kumar Dey
+ * -------------------------------------------------------
+ * Date: 26th May, 2015
+ */
+  
+  
+  /* Model: Adaptive Shrinkage Method (ASH) - Poisson GLM model
+   * Model description: y[j] ~ Poi(mu+beta[t(j)],s[j])
+   * mu ~ N(0,1000)
+   * beta[t] ~ p_0 \delta_{0} + \sum_{k=1}^{K} p_k N(0, sigma[k])    for each j 
+   * sigma[k] ~ m^{k} s_{min}  
+   * m <- sqrt(2)
+   * k chosen  to be the last k such that m^{k} s_{min} < s_{max}
+   */
+  
+  
+  data {
+          int<lower=1> N; //...  the sample size 
+          int<lower=1> K; //... the number of mixing components
+          int<lower=0> B; //...  the number of batches 
+          int<lower=0> counts[N]; //.. the count response  
+          int<lower=1> batch[N] ;   //... the vector of tissue or batch labels
+          vector<lower=0>[K] se_mix; //... standard error of mixing comp, obtained from grid method
+          vector<lower=0>[K] alpha; //... the known prior parameter for mixing proportions
+       }
+
+parameters {
+              simplex[K] prop; //... proportion vector for different mix comp.
+              vector[B] beta ; //... the true parameter of interest
+              real mu; //... the intercept term in Poisson GLM
+           }
+
+
+
+model {
+          real ps[K-1];
+          //.. int batch_lab;
+          prop ~ dirichlet(alpha);
+          //... mu ~ normal(0,1000);
+  
+          for(b in 1:B)
+          {
+              //....  Mixture normal prior for beta 
+              //... ps[1] <- log(prop[1]);
+    
+              if (beta[b]==0) 
+      
+                  increment_log_prob(bernoulli_log(1,prop[1]));
+    
+              else
+              {
+      
+                  for(k in 2:K)
+                  {
+                      ps[k-1] <- log(prop[k]) + normal_log(beta[b],0,se_mix[k]); 
+                  }
+      
+              increment_log_prob(log_sum_exp(ps));
+              
+              }
+      
+          }
+    
+          for(n in 1:N)
+          {
+            //... batch_lab <- batch[n];
+            counts[n] ~ poisson_log(mu+beta[batch[n]]) ; //...  the data likelihood
+          }
+    
+        
+      }
+
+
+```
+
+The model code for the STAN ash model is given as follows 
+
+```{r model_stan_code_ash, echo=TRUE, eval=FALSE}
+
+/* Stan Model Tutorial : Adaptive Shrinkage Model (Full Bayes approach)
+ * Author: Kushal Kumar Dey
+ * -------------------------------------------------------
+ * Date: 24th May, 2015
+ */
+  
+  
+  /* Model: Adaptive Shrinkage Method (ASH) - Full Bayes Approach
+   * Model description: b[j] ~ N(beta[j],s[j])
+   * beta[j] ~ p_0 \delta_{0} + \sum_{k=1}^{K} p_k N(0, sigma[k])    for each j
+   * p_k ~ Dir(alpha);
+   * sigma[k] ~ m^{k} s_{min}  
+   * m <- sqrt(2)
+   * k chosen  to be the last k such that m^{k} s_{min} < s_{max}
+   */
+  
+  
+data {
+         int<lower=1> N; //...  the sample size 
+         int<lower=1> K; //... the number of mixing components 
+         vector[N] betahat;   //... the betahat (effects) values vector
+         vector<lower=0>[N] se; //... the standard error of the betahat (effects) values
+         vector<lower=0>[K] se_mix; //... standard error of mixing comp, obtained from grid method
+         vector<lower=0>[K] alpha; //... the known prior parameter for mixing proportions
+        }
+
+parameters {
+              vector[N] beta; //... the true effect sizes 
+              vector<lower=0>[K] sigma; //... the mixing scale for the K mixing components
+              simplex[K] prop; //... proportion vector for different mix comp.
+              
+           }
+
+model {
+        real ps[K-1];
+        //.. int batch_lab;
+        prop ~ dirichlet(alpha);
+        //... mu ~ normal(0,1000);
+        
+        for(n in 1:N)
+        {
+              //....  Mixture normal prior for beta 
+              //... ps[1] <- log(prop[1]);
+    
+              if (beta[n]==0) 
+      
+                  increment_log_prob(bernoulli_log(1,prop[1]));
+    
+              else
+              {
+      
+                  for(k in 2:K)
+                  {
+                      ps[k-1] <- log(prop[k]) + normal_log(beta[n],0,se_mix[k]); 
+                  }
+      
+              increment_log_prob(log_sum_exp(ps));
+              
+              }
+              
+              betahat[n] ~ normal(beta[n],se[n]);
+      
+        }
+          
+         
+    }
+
+
+
+```
+
