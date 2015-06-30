@@ -34,7 +34,7 @@ transformed parameters {
                           vector[K-1] prop_reverse;  // we reverse the simplex 
                           for(k in 2:K)
                           {
-                            prop_reverse[k-1] <- log((prop[k]+1)/(prop[1]+1));
+                            prop_reverse[k-1] <- log((prop[k])/(prop[1]));
                           }
                          
                        }
