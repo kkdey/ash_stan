@@ -1,0 +1,589 @@
+---
+title: "ash using STAN "
+author: Your name
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+We try to implement **ash** using STAN. STAN provides a nice framework to define the model and then perform a HMC+NUTS sampler to perform parameter inference. We tried to fit the following model of **ash** using STAN.
+
+### The Model
+
+Suppose we have the estimates of some parameters $\hat{\beta} = \left( \hat{\beta}_1, \hat{\beta}_2, \cdots, \hat{\beta}_n \right)$ and standard error of $\hat{\beta}$ is $se(\hat{\beta}) = \left( s_1, s_2, \cdots, s_n \right)$. Using this we want to perform shrinkage on the parameters $\beta = c(\beta_1, \beta_2, \cdots, \beta_n)$. We use the model
+
+$$  L(\hat{\beta},\beta,s) \propto \prod_{n=1}^{N} exp \left (-0.5* \frac{(\hat{\beta}_n - \beta_n)^2}{s^2_n} \right )$$
+
+which is equivalent to the assumption 
+
+$$ \hat{\beta}_n \sim N \left ( \beta_n, s^2_n \right )  $$
+
+We assume that all the $\beta_n$ are all iid with the prior 
+
+$$ \beta_n \sim  \pi_0 + \sum_{k=1}^{K} \pi_k N(0, \sigma^2_k)  $$
+
+Here we take 
+
+$$ \pi \sim Dir \left (1,\frac{1}{K},\frac{1}{K},\cdots,\frac{1}{K} \right ) $$
+
+giving more weightage to 0 value (as we are shrinking to 0).
+
+In order to fix the number of mixture components and the corresponding standard errors of the mixtures, we use the following auto sd implementation of Matthew
+
+```{r echo=TRUE, eval=FALSE}
+autoselect.mixsd = function(betahat,sebetahat,mult){
+  sebetahat=sebetahat[sebetahat!=0] #To avoid exact measure causing (usually by mistake)
+  sigmaamin = min(sebetahat)/10 #so that the minimum is small compared with measurement precision
+  if(all(betahat^2<=sebetahat^2)){
+    sigmaamax = 8*sigmaamin #to deal with the occassional odd case where this could happen; 8 is arbitrary
+  }else{
+    sigmaamax = 2*sqrt(max(betahat^2-sebetahat^2)) #this computes a rough largest value you'd want to use, based on idea that sigmaamax^2 + sebetahat^2 should be at least betahat^2   
+  }
+  if(mult==0){
+    return(c(0,sigmaamax/2))
+  }else{
+    npoint = ceiling(log2(sigmaamax/sigmaamin)/log2(mult))
+    return(mult^((-npoint):0) * sigmaamax)
+  }
+}
+```
+
+We use two approaches to perform inference on this model. 
+
+- the HMC+NUTS sampler using STAN
+- Stochastic MAP estimation
+
+
+The HMC+NUTS sampler did work but it seemed too slow (it would take around 10 minutes to run one chain for 10,000 iterations for a vector of size 50), which seems to be not worthy of using specially for large vectors as we will encounter usually and given the fact that standard **ash** with the EM approach performs the analysis so quickly. 
+
+So, I thought of using the Stochastic Batch wise MAP estimation for the **ash** model. Basically the idea was to do something similar in spirit to the **TeraStructure** paper by P. Gopalan and D. Blei. 
+
+### Stochastic MAP sampling scheme 
+
+1 - In this scheme, ideally in each iteration (say it is fixed at $t$ as of now) I am picking up batches of indices from the original data of $\hat{\beta}$ and $s$. For instance, if there are 500 observations of $\hat{\beta}$ and $s$, then we may take 5 batches of 100 observations each and then run ash in parallel on each batch (the 100 observations). 
+
+2 - In our case, the parameters $\beta$ (the true values) would be the local parameters and the mixture proportions $\pi_k$ would be the global paramters. 
+
+3 - We can run **ash** on each batch and update the local parameters $\beta$. From each batch we will get some estimate of $\pi$. One issue would be how to combine the information about $\pi$ from the individual batches to update this global parameter.
+
+4 -  As of now, what I did was transform the simplex parameter $\pi$ to 
+ another paramter $\nu$ which is unconstrained by defining 
+
+$$ \nu_k = log (\pi_k / \pi_1) \hspace{1 cm} k=2,3,\cdots, K  $$
+
+   and reverse transform this $\nu$ to get the $\pi$, the actual  
+   paramter of interest. We update $\nu$ from each batch and then we 
+   take the average of the $\nu$ values across all the batches. 
+  
+5 - Now the question stands: how to estimate the batch level ash paramters? One can simply use the standard **ash**, but that does not assume the prior on the mixture proportions (I guess!!), specially the mass at the degenerate value $0$. The HMC+NUTS sampler would perform better on such a smaller dataset, so in a way it would be better to do it. But imagine you have 1 million data points, and you would not want to select too small batches. Even for batch size 1000, HMC+NUTS sampler would be pretty slow. Add to that the overhead of running all those chains in parallel each for 10,000 iterations. In short, it does not seem a very viable technique to use in these situations. 
+
+6 - I thought instead, it could be worthwhile to perform Stochastic gradient descent on the posterior log likelihood and then update the parameters in a batch. This should be less time expensive as the only time expenditure is in computing a numerical noisy version of the gradient at each set of  parameter values in a batch. 
+
+Let $\hat{\beta}_b$ and $s_b$ be the set of effect sizes and standar errors in a batch. If the actual $\hat{\beta}$ is of 1000 observations, then assume without loss of generality, $\hat{\beta}_b$ is of length 100 and so is $s_b$ and $b$ ranges from $1$ to $10$. This would be analogous to random partition of size 10 of equal size from the 1000 observations. We concentrate on individual parts of the partition.
+
+Let $\beta_b$ be the true parameters for $\hat{\beta}_b$ effect sizes.
+Then we use the same model equations as above but for this reduced set $\beta_b$, $\hat{\beta}_b$ and $s_b$. Let $\pi(\beta_b, \nu | \hat{\beta}_b, s_b)$ be the posterior distribution of the true parameters given the data and then we use the notation $\theta_b = (\beta_b, \nu)$ and write 
+
+$$ \theta_{t+1} = \theta_{t} + \alpha_t * \nabla log \pi(\beta_b, \nu  | \hat{\beta}_b, s_b) $$
+
+where $t$ represents the iteration number. 
+
+7 - We run this process over multiple iterations and record the average log likelihood value at eahc step to keep a tab on the behavior of the stochastic gradient descent approach.The number of iterations we vary from $10$ to $50$ to $100$. 
+
+8 - There are two very crucial issues here. One is the choice of the stepsize $\alpha_t$ and the other is the choice of the number of batches. As of now, I am not playing with the number of batches, since I have started working with a vector of length 50 only. Also, the current focus is to get the implementation right without worrying about batch selection.
+
+9 -  As for $\alpha_t$, ideally Robbins Monro algorithm says that $\alpha_t$ should follow the following 
+
+$$ \sum_t \alpha_t = \infty  \hspace{1 cm} \sum_t \alpha_t^2 < \infty $$
+
+However even after satisfying the conditions, the choice of $\alpha_t$ was found to be playing a key role. This is evident because if $\alpha_t$ is too small, say $0.00001/t$, it satisfies the conditions alright but the staochastic gradient descent will effectively be stationary (unless you start from a very distant point). For large $\alpha_t$, there will be lots of fluctuations and the chain would be unstable. 
+
+I also felt that the step size should depend on the values of the standard errors. So, I sort of took a leaf out of the TeraStructure papaer and selected the stepsize to be 
+
+$$ \alpha_t = \frac{0.5}{(t+\tau)^{\kappa}} $$
+
+and the moves to be of the form 
+
+$$  \theta_{t+1} = \theta_{t} + \alpha_t * s^{pool}_b * \nabla log \pi(\beta_b, \nu  | \hat{\beta}_b, s_b) $$
+
+where 
+
+$$ s^{pool}_b =c(s_b, rep(1, length(\nu)) $$
+
+I take $\tau=1$ and $\kappa=0.5$, as this choice was taken in one of the examples by Blei and Gopalan in their TeraStructure paper. 
+
+The stepsize does not seem like the optimal one and frankly, it is not shrinking as much as the standard ash or the HMC sampler. Also some of the values seem to be off by some margin. It can be due to multiple reasons- the process is yet to converge (though it seems the gradient descent algorithm tends to hover in the same region) and secondly, the step size is not optimal. However I think there is something different in the model I am assuming may be, because the amount of shrinkage even for HMC+NUTS sampler is way less than the standard ash. 
+
+10- We report the log likelihood value (average over batch size) after each batch run. Then we sum the scores from individual batches to get a log likelihood score over all batches combined. Since we have started with a single batch, we report only one value of the score function in the example below. 
+
+11- The number of iterations should ideally depend on the tolerance limit of the score or the log likelihood value, but as of now we fixed it to a certain value. Currently I am performing **niter** many steps, and the value of **niter** in the example below is $200$.
+
+
+
+
+
+```{r echo=TRUE, eval=FALSE}
+
+source('ash_stochastic_map.R');
+beta_data=c(rnorm(10,0,1),rnorm(10,1,1),rnorm(10,0,0.1),rnorm(10,0,10),rnorm(10,4,1));
+sebeta_data=c(rep(1,10),rep(1,10),rep(0.1,10),rep(10,10),rep(1,10));
+
+model_filename_MAP <- 'ash_reg_stan_propdir.stan';
+batch_size = 50;
+
+res1 <- ash.MAP (beta_data, sebeta_data, model_filename_MAP, batch_size, exec.method="snow")
+res1$beta_est;
+
+#########    The iteration score values from iteration number 1 to 200  ######################################
+
+[1] "The score value is -11.4789173788591"
+[1] "end of iteration 1"
+[1] "The score value is -22.2624876992266"
+[1] "end of iteration 2"
+[1] "The score value is -42.4436145428804"
+[1] "end of iteration 3"
+[1] "The score value is -61.3653783752218"
+[1] "end of iteration 4"
+[1] "The score value is -65.8665998770297"
+[1] "end of iteration 5"
+[1] "The score value is -53.1494174707062"
+[1] "end of iteration 6"
+[1] "The score value is -33.4018984183634"
+[1] "end of iteration 7"
+[1] "The score value is -17.656715189843"
+[1] "end of iteration 8"
+[1] "The score value is -9.30512336727612"
+[1] "end of iteration 9"
+[1] "The score value is -6.10597508157102"
+[1] "end of iteration 10"
+[1] "The score value is -5.17967285431035"
+[1] "end of iteration 11"
+[1] "The score value is -5.40263674106471"
+[1] "end of iteration 12"
+[1] "The score value is -4.85574727025906"
+[1] "end of iteration 13"
+[1] "The score value is -5.5913102612314"
+[1] "end of iteration 14"
+[1] "The score value is -5.06290034510643"
+[1] "end of iteration 15"
+[1] "The score value is -5.04112810758039"
+[1] "end of iteration 16"
+[1] "The score value is -5.27638289483906"
+[1] "end of iteration 17"
+[1] "The score value is -4.92536242252518"
+[1] "end of iteration 18"
+[1] "The score value is -5.25035326742916"
+[1] "end of iteration 19"
+[1] "The score value is -5.236984806036"
+[1] "end of iteration 20"
+[1] "The score value is -5.15765411133888"
+[1] "end of iteration 21"
+[1] "The score value is -5.1903431250081"
+[1] "end of iteration 22"
+[1] "The score value is -5.23386607559957"
+[1] "end of iteration 23"
+[1] "The score value is -5.12463049125723"
+[1] "end of iteration 24"
+[1] "The score value is -4.96666819638533"
+[1] "end of iteration 25"
+[1] "The score value is -5.36653634287099"
+[1] "end of iteration 26"
+[1] "The score value is -4.98080797991917"
+[1] "end of iteration 27"
+[1] "The score value is -5.23359407910312"
+[1] "end of iteration 28"
+[1] "The score value is -5.0413768679072"
+[1] "end of iteration 29"
+[1] "The score value is -5.17053664838617"
+[1] "end of iteration 30"
+[1] "The score value is -4.8978149478843"
+[1] "end of iteration 31"
+[1] "The score value is -5.13927223505151"
+[1] "end of iteration 32"
+[1] "The score value is -5.0666762375058"
+[1] "end of iteration 33"
+[1] "The score value is -4.95487892034166"
+[1] "end of iteration 34"
+[1] "The score value is -5.23327951221765"
+[1] "end of iteration 35"
+[1] "The score value is -4.95515206387766"
+[1] "end of iteration 36"
+[1] "The score value is -5.11106250866432"
+[1] "end of iteration 37"
+[1] "The score value is -4.92811473757561"
+[1] "end of iteration 38"
+[1] "The score value is -5.07418767758891"
+[1] "end of iteration 39"
+[1] "The score value is -4.85946883871403"
+[1] "end of iteration 40"
+[1] "The score value is -4.77732418899222"
+[1] "end of iteration 41"
+[1] "The score value is -5.15954618047737"
+[1] "end of iteration 42"
+[1] "The score value is -4.78276870002842"
+[1] "end of iteration 43"
+[1] "The score value is -4.899567632024"
+[1] "end of iteration 44"
+[1] "The score value is -5.05154461696159"
+[1] "end of iteration 45"
+[1] "The score value is -4.8761530501629"
+[1] "end of iteration 46"
+[1] "The score value is -4.75244488378784"
+[1] "end of iteration 47"
+[1] "The score value is -4.90268370203389"
+[1] "end of iteration 48"
+[1] "The score value is -4.99254177839319"
+[1] "end of iteration 49"
+[1] "The score value is -4.64979177731829"
+[1] "end of iteration 50"
+[1] "The score value is -4.72888587744254"
+[1] "end of iteration 51"
+[1] "The score value is -5.04120931725502"
+[1] "end of iteration 52"
+[1] "The score value is -4.66530231715715"
+[1] "end of iteration 53"
+[1] "The score value is -4.78787307579577"
+[1] "end of iteration 54"
+[1] "The score value is -5.03713150457369"
+[1] "end of iteration 55"
+[1] "The score value is -4.73187539141159"
+[1] "end of iteration 56"
+[1] "The score value is -4.87472054515173"
+[1] "end of iteration 57"
+[1] "The score value is -4.97552801866983"
+[1] "end of iteration 58"
+[1] "The score value is -4.56696604363074"
+[1] "end of iteration 59"
+[1] "The score value is -4.7460337144705"
+[1] "end of iteration 60"
+[1] "The score value is -4.85773682410017"
+[1] "end of iteration 61"
+[1] "The score value is -4.64223668274109"
+[1] "end of iteration 62"
+[1] "The score value is -4.83537386382333"
+[1] "end of iteration 63"
+[1] "The score value is -4.81741463745038"
+[1] "end of iteration 64"
+[1] "The score value is -4.61792651423816"
+[1] "end of iteration 65"
+[1] "The score value is -4.79562835209066"
+[1] "end of iteration 66"
+[1] "The score value is -4.84874408780896"
+[1] "end of iteration 67"
+[1] "The score value is -4.77538626678258"
+[1] "end of iteration 68"
+[1] "The score value is -4.82683469084091"
+[1] "end of iteration 69"
+[1] "The score value is -4.8306841784545"
+[1] "end of iteration 70"
+[1] "The score value is -4.81354820889459"
+[1] "end of iteration 71"
+[1] "The score value is -4.87478682459395"
+[1] "end of iteration 72"
+[1] "The score value is -4.70838755392981"
+[1] "end of iteration 73"
+[1] "The score value is -4.72935095711842"
+[1] "end of iteration 74"
+[1] "The score value is -4.86079865548472"
+[1] "end of iteration 75"
+[1] "The score value is -4.85506453808311"
+[1] "end of iteration 76"
+[1] "The score value is -4.80577919024485"
+[1] "end of iteration 77"
+[1] "The score value is -4.75871316558126"
+[1] "end of iteration 78"
+[1] "The score value is -4.73173522568942"
+[1] "end of iteration 79"
+[1] "The score value is -4.6035006298482"
+[1] "end of iteration 80"
+[1] "The score value is -4.72169852098796"
+[1] "end of iteration 81"
+[1] "The score value is -4.93204873171261"
+[1] "end of iteration 82"
+[1] "The score value is -4.53047130733884"
+[1] "end of iteration 83"
+[1] "The score value is -4.62921726211585"
+[1] "end of iteration 84"
+[1] "The score value is -4.79286546475581"
+[1] "end of iteration 85"
+[1] "The score value is -4.64585919016836"
+[1] "end of iteration 86"
+[1] "The score value is -4.58813454159118"
+[1] "end of iteration 87"
+[1] "The score value is -4.58481589884358"
+[1] "end of iteration 88"
+[1] "The score value is -4.69848464990224"
+[1] "end of iteration 89"
+[1] "The score value is -4.72414558598099"
+[1] "end of iteration 90"
+[1] "The score value is -4.63381063347006"
+[1] "end of iteration 91"
+[1] "The score value is -4.57898823996431"
+[1] "end of iteration 92"
+[1] "The score value is -4.56140659454983"
+[1] "end of iteration 93"
+[1] "The score value is -4.63240494312477"
+[1] "end of iteration 94"
+[1] "The score value is -4.59409578216053"
+[1] "end of iteration 95"
+[1] "The score value is -4.5929498450386"
+[1] "end of iteration 96"
+[1] "The score value is -4.63774969309312"
+[1] "end of iteration 97"
+[1] "The score value is -4.62861170963958"
+[1] "end of iteration 98"
+[1] "The score value is -4.5085604781419"
+[1] "end of iteration 99"
+[1] "The score value is -4.60243036979051"
+[1] "end of iteration 100"
+[1] "The score value is -4.62427875169726"
+[1] "end of iteration 101"
+[1] "The score value is -4.66388242973262"
+[1] "end of iteration 102"
+[1] "The score value is -4.71671315272853"
+[1] "end of iteration 103"
+[1] "The score value is -4.70444746012009"
+[1] "end of iteration 104"
+[1] "The score value is -4.68051800388922"
+[1] "end of iteration 105"
+[1] "The score value is -4.63837450559116"
+[1] "end of iteration 106"
+[1] "The score value is -4.69152422316552"
+[1] "end of iteration 107"
+[1] "The score value is -4.68217434487136"
+[1] "end of iteration 108"
+[1] "The score value is -4.67825683043228"
+[1] "end of iteration 109"
+[1] "The score value is -4.64050054619467"
+[1] "end of iteration 110"
+[1] "The score value is -4.66645066734694"
+[1] "end of iteration 111"
+[1] "The score value is -4.65685034337654"
+[1] "end of iteration 112"
+[1] "The score value is -4.65862592914443"
+[1] "end of iteration 113"
+[1] "The score value is -4.62944656075313"
+[1] "end of iteration 114"
+[1] "The score value is -4.64352547835949"
+[1] "end of iteration 115"
+[1] "The score value is -4.62729607720355"
+[1] "end of iteration 116"
+[1] "The score value is -4.63298550684952"
+[1] "end of iteration 117"
+[1] "The score value is -4.61098901179794"
+[1] "end of iteration 118"
+[1] "The score value is -4.61728876592462"
+[1] "end of iteration 119"
+[1] "The score value is -4.59830731519586"
+[1] "end of iteration 120"
+[1] "The score value is -4.60213565194233"
+[1] "end of iteration 121"
+[1] "The score value is -4.58341364131866"
+[1] "end of iteration 122"
+[1] "The score value is -4.58538820067989"
+[1] "end of iteration 123"
+[1] "The score value is -4.56748286542324"
+[1] "end of iteration 124"
+[1] "The score value is -4.56746174149679"
+[1] "end of iteration 125"
+[1] "The score value is -4.55021813007238"
+[1] "end of iteration 126"
+[1] "The score value is -4.54818774139221"
+[1] "end of iteration 127"
+[1] "The score value is -4.5314996592944"
+[1] "end of iteration 128"
+[1] "The score value is -4.5274865142258"
+[1] "end of iteration 129"
+[1] "The score value is -4.51124173382767"
+[1] "end of iteration 130"
+[1] "The score value is -4.50532776389887"
+[1] "end of iteration 131"
+[1] "The score value is -4.48941950300615"
+[1] "end of iteration 132"
+[1] "The score value is -4.4817601756106"
+[1] "end of iteration 133"
+[1] "The score value is -4.46610213415849"
+[1] "end of iteration 134"
+[1] "The score value is -4.45695591513172"
+[1] "end of iteration 135"
+[1] "The score value is -4.44149522328011"
+[1] "end of iteration 136"
+[1] "The score value is -4.4312661869458"
+[1] "end of iteration 137"
+[1] "The score value is -4.41595081837726"
+[1] "end of iteration 138"
+[1] "The score value is -4.40492147397577"
+[1] "end of iteration 139"
+[1] "The score value is -4.36121947189045"
+[1] "end of iteration 140"
+[1] "The score value is -4.40349053037269"
+[1] "end of iteration 141"
+[1] "The score value is -4.31578187762436"
+[1] "end of iteration 142"
+[1] "The score value is -4.38590505064245"
+[1] "end of iteration 143"
+[1] "The score value is -4.36990962517549"
+[1] "end of iteration 144"
+[1] "The score value is -4.36184336810655"
+[1] "end of iteration 145"
+[1] "The score value is -4.34669727234151"
+[1] "end of iteration 146"
+[1] "The score value is -4.34156208427414"
+[1] "end of iteration 147"
+[1] "The score value is -4.32779698668117"
+[1] "end of iteration 148"
+[1] "The score value is -4.3251075055937"
+[1] "end of iteration 149"
+[1] "The score value is -4.31300405968748"
+[1] "end of iteration 150"
+[1] "The score value is -4.31215780303921"
+[1] "end of iteration 151"
+[1] "The score value is -4.30154985388232"
+[1] "end of iteration 152"
+[1] "The score value is -4.30202899418646"
+[1] "end of iteration 153"
+[1] "The score value is -4.29233255713929"
+[1] "end of iteration 154"
+[1] "The score value is -4.29362400137306"
+[1] "end of iteration 155"
+[1] "The score value is -4.28431237260304"
+[1] "end of iteration 156"
+[1] "The score value is -4.28601933864278"
+[1] "end of iteration 157"
+[1] "The score value is -4.27685442190348"
+[1] "end of iteration 158"
+[1] "The score value is -4.27870429610408"
+[1] "end of iteration 159"
+[1] "The score value is -4.26963692957791"
+[1] "end of iteration 160"
+[1] "The score value is -4.27138881827645"
+[1] "end of iteration 161"
+[1] "The score value is -4.26246244510358"
+[1] "end of iteration 162"
+[1] "The score value is -4.26382982254852"
+[1] "end of iteration 163"
+[1] "The score value is -4.25515296683176"
+[1] "end of iteration 164"
+[1] "The score value is -4.25573118796668"
+[1] "end of iteration 165"
+[1] "The score value is -4.24747443513125"
+[1] "end of iteration 166"
+[1] "The score value is -4.24646532399966"
+[1] "end of iteration 167"
+[1] "The score value is -4.22885067133317"
+[1] "end of iteration 168"
+[1] "The score value is -4.2468334980415"
+[1] "end of iteration 169"
+[1] "The score value is -4.24027196643149"
+[1] "end of iteration 170"
+[1] "The score value is -4.23438333098809"
+[1] "end of iteration 171"
+[1] "The score value is -4.23078490580689"
+[1] "end of iteration 172"
+[1] "The score value is -4.2236292004793"
+[1] "end of iteration 173"
+[1] "The score value is -4.22292192251137"
+[1] "end of iteration 174"
+[1] "The score value is -4.21572159304111"
+[1] "end of iteration 175"
+[1] "The score value is -4.21597785449532"
+[1] "end of iteration 176"
+[1] "The score value is -4.20921799775263"
+[1] "end of iteration 177"
+[1] "The score value is -4.20912158177289"
+[1] "end of iteration 178"
+[1] "The score value is -4.20166043254097"
+[1] "end of iteration 179"
+[1] "The score value is -4.11234811174307"
+[1] "end of iteration 180"
+[1] "The score value is -4.21743170504373"
+[1] "end of iteration 181"
+[1] "The score value is -4.21507271385856"
+[1] "end of iteration 182"
+[1] "The score value is -4.20773393868544"
+[1] "end of iteration 183"
+[1] "The score value is -4.20556996302739"
+[1] "end of iteration 184"
+[1] "The score value is -4.19832718129009"
+[1] "end of iteration 185"
+[1] "The score value is -4.19602869263724"
+[1] "end of iteration 186"
+[1] "The score value is -4.18864691589342"
+[1] "end of iteration 187"
+[1] "The score value is -4.18605347099039"
+[1] "end of iteration 188"
+[1] "The score value is -4.17836493705383"
+[1] "end of iteration 189"
+[1] "The score value is -4.17516657117629"
+[1] "end of iteration 190"
+[1] "The score value is -4.16327745015314"
+[1] "end of iteration 191"
+[1] "The score value is -4.162079747806"
+[1] "end of iteration 192"
+[1] "The score value is -4.15363993227038"
+[1] "end of iteration 193"
+[1] "The score value is -4.14955247331732"
+[1] "end of iteration 194"
+[1] "The score value is -4.14052164599587"
+[1] "end of iteration 195"
+[1] "The score value is -4.13571269380567"
+[1] "end of iteration 196"
+[1] "The score value is -4.12601436178633"
+[1] "end of iteration 197"
+[1] "The score value is -4.12039358066751"
+[1] "end of iteration 198"
+[1] "The score value is -4.10843940278093"
+[1] "end of iteration 199"
+[1] "The score value is -4.02795118205111"
+[1] "end of iteration 200"
+
+##############  the effect sizes (betahat) ##########################################
+
+> beta_data
+ [1]   0.56222189   0.61360441  -0.81254814  -0.67612982  -1.79981698   0.80528371  -0.01952314  -0.53471546   0.22832503  -0.11415630
+[11]   0.56528452   0.58614255   1.72057794   2.21958198   0.51969291   2.02088065   2.10911028   1.98579810   0.89387208   0.55534267
+[21]  -0.08912186   0.04435130   0.09767669  -0.17035268  -0.08704784  -0.23015967   0.07292642   0.02351763  -0.00612287   0.09245257
+[31]  -4.73395636  13.66035647   2.71587774   7.27811818  -5.25494148 -12.96252231 -13.08838480  -9.93840288  -7.85083342 -11.56325765
+[41]   5.16162262   5.43945196   4.04527713   5.42756787   4.11114438   4.73884936   4.08988218   3.52034668   5.73798095   4.72378954
+
+#############   estimated effects from Stochastic Approximation  ######################
+
+> res1$beta_est;
+ [1]   0.56018177   0.61137896  -0.80960642  -0.67367887  -1.79338597   0.80236808   0.57952397  -0.53277402  -0.04178166  -0.51810672
+[11]   0.56323336   0.58401619   1.71442271   2.21170104   0.51780476   2.01368386   2.10160925   1.97872250   0.89063867   0.55332730
+[21]  -0.01295044   0.02743764   0.01478597  -0.03538968  -0.01253429  -0.22641676   0.01622962   0.02763348   0.01964239   0.01363688
+[31]  -3.81571568  11.06514048   2.18089091   5.87989635  -4.23821571 -10.49782724 -10.60013939  -8.04046191  -6.34489825  -9.36061478
+[41]   5.14381912   5.42072162   4.03121356   5.40887715   4.09685952   4.72245940   4.07566874   3.50804957   5.71825664   4.70745000
+
+##############   estimated effects from Matthew's ash #################################
+
+res2 <- ash(beta_data,sebeta_data);
+res2$PosteriorMean;
+
+[1]   4.302424e-02  4.828310e-02 -7.280949e-02 -5.521334e-02 -4.738867e-01  7.177345e-02 -1.290267e-03 -4.035284e-02  1.545857e-02
+[10] -7.589176e-03  4.332763e-02  4.542702e-02  4.080326e-01  1.007247e+00  3.893294e-02  7.130375e-01  8.340714e-01  6.691302e-01
+[19]  8.530240e-02  4.234719e-02 -9.282241e-04  3.435460e-04  1.100992e-03 -4.992687e-03 -8.903779e-04 -2.092563e-02  6.669927e-04
+[28]  1.698236e-04 -4.309664e-05  9.921587e-04 -1.667568e-01  5.003319e-01  9.531593e-02  2.582922e-01 -1.853448e-01 -4.727397e-01
+[37] -4.776926e-01 -3.566025e-01 -2.792015e-01 -4.183457e-01  5.003365e+00  5.201106e+00  4.013195e+00  5.193106e+00  4.079690e+00
+[46]  4.662277e+00  4.058359e+00  3.418143e+00  5.388386e+00  4.649314e+00
+
+#############   estimated effects from HMC+NUTS sampler (takes 1 min for 1000 iterations)  #################################
+
+> res3$beta_est
+ [1] -0.004519060  0.117854031 -0.015397268 -0.055158369 -0.800717955  0.100852721  0.051965587 -0.069250809  0.063559063  0.070685385
+[11]  0.070708457  0.194967044  0.635321230  0.590618987  0.021523232  0.819139905  0.937857345  0.635928924  0.122134506  0.080082650
+[21] -0.025414851  0.005970542  0.023007476 -0.050471107 -0.019576584 -0.090636460  0.012495517  0.007210215 -0.002251973  0.023882649
+[31]  0.372167891  0.450226551  0.365863188  0.005242683 -0.358414331 -0.416465802  0.022580706 -0.205378927  0.097202902 -0.413377102
+[41]  4.851538864  5.119469534  3.576869242  5.029520620  3.890728433  4.457573360  3.857171121  3.093132257  5.305834725  4.336403574
+
+
+```
+
+
+
+
+
+
+
+
+
+ 

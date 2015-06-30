@@ -8,7 +8,7 @@ exec.maethod <- 'foreach';
 
 source('ash_stochastic_map.R');
 beta_data=c(rnorm(10,0,1),rnorm(10,1,1),rnorm(10,0,0.1),rnorm(10,0,10),rnorm(10,4,1));
-sebeta_data=c(rep(1,10),rep(1,10),rep(2,10),rep(10,10),rep(1,10));
+sebeta_data=c(rep(1,10),rep(1,10),rep(0.1,10),rep(10,10),rep(1,10));
 
 model_filename_MAP <- 'ash_reg_stan_propdir.stan';
 batch_size = 50;

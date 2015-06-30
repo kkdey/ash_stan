@@ -10,6 +10,7 @@ library(snow)
 library(parallel)
 library(doParallel)
 library(foreach)
+library(nlme)
 
 ## ****************** Select the mixture components and corresponding standard errors of mixing components ********************** ##
 
@@ -95,10 +96,15 @@ doichunk <- function(ichunk)
   for (step in 1:nstep_descent)
   {
     grad <- grad_log_prob(iter_model,params_sub_iter) ;
-    params_sub_iter <- params_sub_iter + 0.1*stepsize(iter, kappa, tau) *(sebeta_data[subsample_iter])*grad;
+   # hess <- -diag(fdHess(params_sub_iter, function(x) log_prob(iter_model, x))$Hessian);
+   # hess[hess>=0 & hess<0.001]=0.001;
+   # hess[hess<=0 & hess>(-0.001)]=-0.001;
+     params_sub_iter <- params_sub_iter + 0.5*stepsize(iter, kappa, tau) *(c(sebeta_data[subsample_iter],rep(1,length(params_prop_rev)))*grad);
+  #  params_sub_iter <- params_sub_iter + 0.5 * stepsize(iter, kappa, tau) * grad;
+    score=log_prob(iter_model, params_sub_iter) / batch_size;
   }
   
-  out_list <- list("model"=iter_model, "index"=subsample_iter, "params" = params_sub_iter, "score"=log_prob(iter_model, params_sub_iter) / batch_size);
+  out_list <- list("model"=iter_model, "index"=subsample_iter, "params" = params_sub_iter, "score"=score);
   return(out_list);
 }
 
@@ -107,7 +113,7 @@ doichunk <- function(ichunk)
 
 ##  **************************   The main function for Stochastic MAP estimation in ash  ****************************** ##
 
-ash.MAP  <- function(beta_data, sebeta_data, model_filename_MAP, batch_size, niter=50, nstep_descent=1,  
+ash.MAP  <- function(beta_data, sebeta_data, model_filename_MAP, batch_size, niter=200, nstep_descent=1,  
                      multiplier=sqrt(2), model=NULL, exec.method = c("snow", "foreach", "serial"),kappa=0.5, tau=1)
 {
   
@@ -181,6 +187,7 @@ ash.MAP  <- function(beta_data, sebeta_data, model_filename_MAP, batch_size, nit
         new_prop_rev = Reduce("+", prop_rev_list) / length(prop_rev_list);
         new_params = c(new_params_beta, new_prop_rev);
         total_score = sum(unlist(lapply(iter_out,function(x) x$score)));
+        print(paste("The score value is", total_score));
         
     }
       
