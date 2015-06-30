@@ -95,7 +95,7 @@ doichunk <- function(ichunk)
   for (step in 1:nstep_descent)
   {
     grad <- grad_log_prob(iter_model,params_sub_iter) ;
-    params_sub_iter <- params_sub_iter + 0.01*stepsize(iter, kappa, tau) * grad;
+    params_sub_iter <- params_sub_iter + 0.1*stepsize(iter, kappa, tau) *(sebeta_data[subsample_iter])*grad;
   }
   
   out_list <- list("model"=iter_model, "index"=subsample_iter, "params" = params_sub_iter, "score"=log_prob(iter_model, params_sub_iter) / batch_size);
