@@ -1,12 +1,13 @@
 # ash_stan
 A Git repo for ash using STAN
 
-Holds the STAN codes for 6 full bayes methods of adaptive shrinkage inference in "stan_files"
+Includes STAN HMC method + Stochastic MAP method estimation of ash 
 
-stan_ash.RmD presents a rudimentary script showing the codes as to how to use these STAN codes to perform the shrinkage 
-and also comparing the results of the shrinkage of these 6 methods among themselves and also with respect to the emp.
-Bayes approach to inference in the original standard ash method as implemented in the "ashr" package.
+The primary goal is to make the ash method more flexible for very large data and to incorporate a full bayes model for the mixture proportions.
 
-This repo is subject to modifications and any suggestions to modify or change the scripts are welcome.
+We shall also focus on glm_ash:  which is a generalized linear model version of ash
+
+We shall also try to implement Black Box Variational Inference.
+
 
 
