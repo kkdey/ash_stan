@@ -9,6 +9,6 @@ sebetahat <- cbind(sebetahat1, rep(5,length(betahat1)), rep(5,length(betahat1)))
 
 source('ash_fullbayes.R')
 
-res_fullbayes_ash <- ash.stan(betahat, sebetahat, stan_iter = 1000)
+res_fullbayes_ash <- ash.stan(betahat, sebetahat, stan_iter = 1000, shrink_factor=10)
 
 res_standard_ash <- do.call(cbind, lapply(1:dim(betahat)[2],function(ind) ash(betahat[,ind],sebetahat[,ind])$PosteriorMean))

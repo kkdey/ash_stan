@@ -22,7 +22,8 @@ autoselect.mixsd = function(betahat,sebetahat,mult){
 }
 
 
-ash.stan <- function(betahat, sebetahat, mult=sqrt(2), stan_iter, cores=detectCores())
+
+ash.stan <- function(betahat, sebetahat, mult=sqrt(2), stan_iter, cores=detectCores(), shrink_factor=10)
 {
   betahat <- as.matrix(betahat);
   sebetahat <- as.matrix(sebetahat);
@@ -32,7 +33,7 @@ ash.stan <- function(betahat, sebetahat, mult=sqrt(2), stan_iter, cores=detectCo
   ind=1;
   
   se_mix=c(0,autoselect.mixsd(betahat[,ind],sebetahat[,ind],mult));
-  dir_param=c(1,rep(1/(length(se_mix)-1),length(se_mix)-1));
+  dir_param=c(1,rep(1/length(se_mix),length(se_mix)-1));
   test.ash <- list(N=length(betahat[,ind]),
                    K=length(se_mix),
                    betahat=betahat[,ind],
@@ -46,14 +47,14 @@ ash.stan <- function(betahat, sebetahat, mult=sqrt(2), stan_iter, cores=detectCo
   local_chunk <- function(fit, betahat, sebetahat, ind)
   {
     se_mix=c(0,autoselect.mixsd(betahat[,ind],sebetahat[,ind],mult));
-    dir_param=c(1,rep(1/(length(se_mix)-1),length(se_mix)-1));
+    dir_param=c(1,rep(1/(shrink_factor*(length(se_mix)-1)),length(se_mix)-1));
     test.ash <- list(N=length(betahat[,ind]),
                      K=length(se_mix),
                      betahat=betahat[,ind],
                      sebetahat=sebetahat[,ind],
                      se_mix=se_mix,
                      alpha=dir_param);
-    out <- stan(fit = fit1, data = test.ash, chains = 1, iter=stan_iter);
+    out <- stan(fit = fit, data = test.ash, chains = 1, iter=stan_iter);
     temp=summary(out)$summary[,"mean"];
     prop_mix_vec <- as.numeric(temp[1:length(se_mix)]); 
     
@@ -63,7 +64,9 @@ ash.stan <- function(betahat, sebetahat, mult=sqrt(2), stan_iter, cores=detectCo
     for(num in 1:length(betahat[,ind]))
     {
       scaling <- se_mix^2 /(se_mix^2+sebetahat[num,ind]^2);
-      beta_update_vec[num] <- sum(scaling*prop_mix_vec)*betahat[num,ind];
+      omega_mix <- prop_mix_vec*dnorm(betahat[num,ind],0,sd=sqrt(sebetahat[num,ind]^2 + se_mix^2));
+      omega_mix <- omega_mix/sum(omega_mix);
+      beta_update_vec[num] <- sum(scaling*omega_mix)*betahat[num,ind];
     }
     
     out <- list("pi_local"=prop_mix_vec,"beta_local"=beta_update_vec)
