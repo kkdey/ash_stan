@@ -61,13 +61,20 @@ ash.stan <- function(betahat, sebetahat, mult=sqrt(2), stan_iter, cores=detectCo
     #  beta_update_mat <- matrix(0, ncol=0, nrow=length(betahat[,ind]));
     
     beta_update_vec <- array(0,length(betahat[,ind]));
-    for(num in 1:length(betahat[,ind]))
-    {
-      scaling <- se_mix^2 /(se_mix^2+sebetahat[num,ind]^2);
-      omega_mix <- prop_mix_vec*dnorm(betahat[num,ind],0,sd=sqrt(sebetahat[num,ind]^2 + se_mix^2));
-      omega_mix <- omega_mix/sum(omega_mix);
-      beta_update_vec[num] <- sum(scaling*omega_mix)*betahat[num,ind];
-    }
+    scaling <- do.call(cbind,lapply(1:length(se_mix), function(k) se_mix[k]^2 /(se_mix[k]^2+sebetahat[,ind]^2)));
+    omega_mix <- do.call(rbind,lapply(1:length(betahat[,ind]), function(num) prop_mix_vec*dnorm(betahat[num,ind],0,sd=sqrt(sebetahat[num,ind]^2 + se_mix^2))));
+    omega_mix <- sweep(omega_mix,1,rowSums(omega_mix),'/');
+    beta_update_vec <- rowSums(scaling*omega_mix)*betahat[,ind];
+    
+#    Serial execution of the above codes (beta_update)
+    
+#    for(num in 1:length(betahat[,ind]))
+#    {
+     # scaling <- se_mix^2 /(se_mix^2+sebetahat[num,ind]^2);
+#      omega_mix <- prop_mix_vec*dnorm(betahat[num,ind],0,sd=sqrt(sebetahat[num,ind]^2 + se_mix^2));
+#      omega_mix <- omega_mix/sum(omega_mix);
+#      beta_update_vec[num] <- sum(scaling*omega_mix)*betahat[num,ind];
+#    }
     
     out <- list("pi_local"=prop_mix_vec,"beta_local"=beta_update_vec)
     return(out)
