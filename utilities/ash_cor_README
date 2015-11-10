@@ -1,0 +1,13 @@
+
+To run ash on correlation matrices (ash cor)
+
+Steps
+
+1. First source ash_cor.R script (make sure the packages are installed)
+2. To use ash_cor function, you need to give it a correlation matrix and a
+   value of n_samples (representing data strength).
+3. ash_cor will produce a shrunken correlation matrix as output.
+4. Check example_ash_cor.R script for how to use this function
+
+For further details, contact me at kkdey@uchicago.edu
+
